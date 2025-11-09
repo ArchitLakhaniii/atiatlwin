@@ -144,7 +144,7 @@ function mergeFlashRequest(
         partial.location?.device_gps &&
         typeof partial.location.device_gps.lat === "number" &&
         typeof partial.location.device_gps.lng === "number"
-          ? partial.location.device_gps
+          ? (partial.location.device_gps as { lat: number; lng: number })
           : base.location.device_gps,
     },
   };
