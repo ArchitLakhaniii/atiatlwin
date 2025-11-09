@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: flashrequest-gemini
+    env: node
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 18.17.0
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PORT
+        value: 3001
