@@ -4,7 +4,7 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
+    --background: 38 18% 96%;
     --foreground: 222.2 84% 4.9%;
     --card: 0 0% 100%;
     --card-foreground: 222.2 84% 4.9%;
@@ -67,9 +67,9 @@
     @apply bg-background text-foreground antialiased font-sans;
   }
   
-  /* Campus feel: clean white background in light mode */
+  /* Campus feel: warm beige background in light mode for reduced eye strain */
   :root {
-    --background: 0 0% 100%;
+    --background: 38 18% 96%;
     --radius: 16px;
   }
   
