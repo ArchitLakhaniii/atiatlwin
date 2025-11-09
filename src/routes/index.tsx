@@ -8,8 +8,13 @@ import { MessagesChatPage } from '@/pages/MessagesChatPage'
 import { UserProfilePage } from '@/pages/UserProfilePage'
 import { SafetyTrustCenterPage } from '@/pages/SafetyTrustCenterPage'
 import { AdminModerationPage } from '@/pages/AdminModerationPage'
+import { LoginPage } from '@/pages/LoginPage'
 
 const appRoutes: RouteObject[] = [
+  {
+    path: '/login',
+    element: <LoginPage />,
+  },
   {
     element: <Layout />,
     children: [

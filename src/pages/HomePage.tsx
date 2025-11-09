@@ -65,6 +65,13 @@ export function HomePage() {
           >
             Browse listings
           </Link>
+
+          <Link
+            to="/login"
+            className="rounded-full border border-black/10 bg-white px-5 py-3 font-semibold text-neutral-800 transition hover:shadow-sm dark:border-white/10 dark:bg-black dark:text-white"
+          >
+            Login / Sign Up
+          </Link>
         </div>
 
         <div className="mt-6 flex items-center justify-center gap-2 text-sm text-neutral-600 dark:text-neutral-300">

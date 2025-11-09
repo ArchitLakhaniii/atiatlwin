@@ -23,6 +23,8 @@ const navLinks = [
   { to: '/listings', label: 'Listings' },
   { to: '/messages', label: 'Messages' },
   { to: '/safety', label: 'Safety' },
+  { to: '/login', label: 'Login' },
+  { to: '/profile', label: 'Profile' },
 ]
 
 const campuses = [

@@ -7,18 +7,26 @@ import random
 import re
 import uuid
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import httpx
 import joblib
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field, EmailStr
+from bson import ObjectId
 
 from .feature_encoder import FeatureEncoder
+from .database import connect_db, close_db, get_db
+from .models import (
+    UserSchema, UserCreate, UserResponse, SellerProfileSchema,
+    SalesHistorySummary
+)
+from .auth import hash_password, verify_password, create_access_token, verify_token
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -1830,8 +1838,20 @@ def build_match_payload(request_id: str, request_record: Dict[str, Any]) -> Dict
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    # Connect to MongoDB (non-blocking if it fails)
+    try:
+        await connect_db()
+    except Exception as e:
+        print(f"[WARNING] MongoDB connection failed on startup: {e}")
+        print("[WARNING] App will continue but user features may not work")
+    # Load demo profiles (for in-memory matching)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, load_demo_profiles)
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    await close_db()
 
 
 @app.get("/health")
@@ -2211,5 +2231,529 @@ async def get_listings(
         "success": True,
         "listings": filtered_listings,
         "total": len(filtered_listings),
+    }
+
+
+# ============================================================================
+# Authentication Endpoints
+# ============================================================================
+
+security = HTTPBearer()
+
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Get current user from JWT token."""
+    token = credentials.credentials
+    try:
+        payload = verify_token(token)
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials"
+            )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(e)
+        )
+    
+    db = get_db()
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found"
+        )
+    return user
+
+
+@app.post("/api/auth/register")
+async def register(user_data: UserCreate) -> Dict[str, Any]:
+    """Register a new user with bio processing."""
+    try:
+        db = get_db()
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed. Please check MongoDB connection."
+        )
+    
+    # Check if user already exists
+    existing_user = await db.users.find_one({"email": user_data.email})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Hash password
+    hashed_password = hash_password(user_data.password)
+    
+    # Create user document
+    user_doc = {
+        "name": user_data.name,
+        "email": user_data.email,
+        "password": hashed_password,
+        "location": user_data.location,
+        "bio": user_data.bio,
+        "verified": False,
+        "trust_score": 70,
+        "rating": 0.0,
+        "past_trades": 0,
+        "badges": [],
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    
+    # Insert user
+    result = await db.users.insert_one(user_doc)
+    user_id = str(result.inserted_id)
+    
+    # Process bio with LLM to generate seller profile
+    try:
+        parsed_profile = await call_gemini_parser(
+            "/api/parse-profile",
+            {"text": user_data.bio, "userId": user_id}
+        )
+        
+        # Create seller profile document
+        seller_profile_doc = {
+            "schema_type": "SELLER_PROFILE",
+            "user_id": user_id,
+            "context": parsed_profile.get("context", {"original_text": user_data.bio}),
+            "profile_keywords": parsed_profile.get("profile_keywords", []),
+            "inferred_major": parsed_profile.get("inferred_major"),
+            "inferred_location_keywords": parsed_profile.get("inferred_location_keywords", []),
+            "sales_history_summary": parsed_profile.get("sales_history_summary", []),
+            "overall_dominant_transaction_type": parsed_profile.get("overall_dominant_transaction_type", "sell"),
+            "related_categories_of_interest": parsed_profile.get("related_categories_of_interest", []),
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        
+        # Insert seller profile
+        profile_result = await db.seller_profiles.insert_one(seller_profile_doc)
+        profile_id = profile_result.inserted_id
+        
+        # Update user with seller profile reference
+        await db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"seller_profile_id": profile_id, "updated_at": datetime.utcnow()}}
+        )
+        
+    except Exception as e:
+        # If bio processing fails, user is still created but without seller profile
+        print(f"Warning: Failed to process bio for user {user_id}: {e}")
+    
+    # Create access token
+    access_token = create_access_token(data={"sub": user_id})
+    
+    return {
+        "success": True,
+        "userId": user_id,
+        "accessToken": access_token,
+        "message": "User registered successfully"
+    }
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+@app.post("/api/auth/login")
+async def login(login_data: LoginRequest) -> Dict[str, Any]:
+    """Login user and return access token."""
+    try:
+        db = get_db()
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed. Please check MongoDB connection."
+        )
+    
+    # Find user
+    user = await db.users.find_one({"email": login_data.email})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password"
+        )
+    
+    # Verify password
+    if not verify_password(login_data.password, user["password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password"
+        )
+    
+    # Create access token
+    access_token = create_access_token(data={"sub": str(user["_id"])})
+    
+    return {
+        "success": True,
+        "userId": str(user["_id"]),
+        "accessToken": access_token,
+        "user": {
+            "id": str(user["_id"]),
+            "name": user["name"],
+            "email": user["email"],
+            "location": user.get("location", ""),
+            "verified": user.get("verified", False),
+        }
+    }
+
+
+@app.get("/api/users/{user_id}/profile")
+async def get_user_profile(user_id: str) -> Dict[str, Any]:
+    """Get user profile with seller profile data."""
+    try:
+        db = get_db()
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed. Please check MongoDB connection."
+        )
+    
+    # Get user
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # Get seller profile if exists
+    seller_profile = None
+    if user.get("seller_profile_id"):
+        seller_profile = await db.seller_profiles.find_one(
+            {"_id": user["seller_profile_id"]}
+        )
+    
+    # Convert ObjectId to string
+    user_response = {
+        "id": str(user["_id"]),
+        "name": user["name"],
+        "email": user["email"],
+        "location": user.get("location", ""),
+        "bio": user.get("bio", ""),
+        "verified": user.get("verified", False),
+        "trustScore": user.get("trust_score", 70),
+        "rating": user.get("rating", 0.0),
+        "pastTrades": user.get("past_trades", 0),
+        "badges": user.get("badges", []),
+        "createdAt": user.get("created_at").isoformat() if user.get("created_at") else None,
+        "updatedAt": user.get("updated_at").isoformat() if user.get("updated_at") else None,
+    }
+    
+    if seller_profile:
+        # Convert ObjectId to string in seller profile
+        seller_profile_response = {
+            "schema_type": seller_profile.get("schema_type"),
+            "user_id": str(seller_profile.get("user_id")),
+            "context": seller_profile.get("context", {}),
+            "profile_keywords": seller_profile.get("profile_keywords", []),
+            "inferred_major": seller_profile.get("inferred_major"),
+            "inferred_location_keywords": seller_profile.get("inferred_location_keywords", []),
+            "sales_history_summary": seller_profile.get("sales_history_summary", []),
+            "overall_dominant_transaction_type": seller_profile.get("overall_dominant_transaction_type", "sell"),
+            "related_categories_of_interest": seller_profile.get("related_categories_of_interest", []),
+        }
+        user_response["sellerProfile"] = seller_profile_response
+    
+    return {
+        "success": True,
+        "user": user_response
+    }
+
+
+@app.get("/api/seller-profiles/{user_id}")
+async def get_seller_profile(user_id: str) -> Dict[str, Any]:
+    """Get detailed seller profile for a user."""
+    db = get_db()
+    
+    seller_profile = await db.seller_profiles.find_one({"user_id": user_id})
+    if not seller_profile:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Seller profile not found"
+        )
+    
+    # Convert ObjectId to string
+    seller_profile_response = {
+        "schema_type": seller_profile.get("schema_type"),
+        "user_id": str(seller_profile.get("user_id")),
+        "context": seller_profile.get("context", {}),
+        "profile_keywords": seller_profile.get("profile_keywords", []),
+        "inferred_major": seller_profile.get("inferred_major"),
+        "inferred_location_keywords": seller_profile.get("inferred_location_keywords", []),
+        "sales_history_summary": seller_profile.get("sales_history_summary", []),
+        "overall_dominant_transaction_type": seller_profile.get("overall_dominant_transaction_type", "sell"),
+        "related_categories_of_interest": seller_profile.get("related_categories_of_interest", []),
+        "created_at": seller_profile.get("created_at").isoformat() if seller_profile.get("created_at") else None,
+        "updated_at": seller_profile.get("updated_at").isoformat() if seller_profile.get("updated_at") else None,
+    }
+    
+    return {
+        "success": True,
+        "profile": seller_profile_response
+    }
+
+
+class ProcessBioRequest(BaseModel):
+    bio: str
+    userId: str
+
+
+@app.post("/api/seller-profiles/process-bio")
+async def process_bio(request: ProcessBioRequest) -> Dict[str, Any]:
+    """Process a bio using LLM and create/update seller profile."""
+    if not request.bio.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Bio cannot be empty"
+        )
+    
+    # Process bio with LLM
+    parsed_profile = await call_gemini_parser(
+        "/api/parse-profile",
+        {"text": request.bio, "userId": request.userId}
+    )
+    
+    db = get_db()
+    
+    # Check if seller profile already exists
+    existing_profile = await db.seller_profiles.find_one({"user_id": request.userId})
+    
+    seller_profile_doc = {
+        "schema_type": "SELLER_PROFILE",
+        "user_id": request.userId,
+        "context": parsed_profile.get("context", {"original_text": request.bio}),
+        "profile_keywords": parsed_profile.get("profile_keywords", []),
+        "inferred_major": parsed_profile.get("inferred_major"),
+        "inferred_location_keywords": parsed_profile.get("inferred_location_keywords", []),
+        "sales_history_summary": parsed_profile.get("sales_history_summary", []),
+        "overall_dominant_transaction_type": parsed_profile.get("overall_dominant_transaction_type", "sell"),
+        "related_categories_of_interest": parsed_profile.get("related_categories_of_interest", []),
+        "updated_at": datetime.utcnow(),
+    }
+    
+    if existing_profile:
+        # Update existing profile
+        await db.seller_profiles.update_one(
+            {"user_id": request.userId},
+            {"$set": seller_profile_doc}
+        )
+        seller_profile_doc["_id"] = existing_profile["_id"]
+    else:
+        # Create new profile
+        seller_profile_doc["created_at"] = datetime.utcnow()
+        result = await db.seller_profiles.insert_one(seller_profile_doc)
+        seller_profile_doc["_id"] = result.inserted_id
+        
+        # Update user with seller profile reference
+        await db.users.update_one(
+            {"_id": ObjectId(request.userId)},
+            {"$set": {"seller_profile_id": seller_profile_doc["_id"], "updated_at": datetime.utcnow()}}
+        )
+    
+    # Convert ObjectId to string
+    seller_profile_doc["_id"] = str(seller_profile_doc["_id"])
+    seller_profile_doc["user_id"] = str(seller_profile_doc["user_id"])
+    
+    return {
+        "success": True,
+        "profile": seller_profile_doc
+    }
+
+
+# ============================================================================
+# Default Profiles Seeding
+# ============================================================================
+
+DEFAULT_PROFILES = [
+    {
+        "name": "Evelyn Chen",
+        "email": "evelyn.art@university.edu",
+        "location": "Portland, OR",
+        "bio": "Portland AI artist blending neural art prints with hand-crafted frames for sustainability-minded buyers. I create unique digital art pieces and custom frame them using recycled materials.",
+        "password": "password123",
+        "sellerProfile": {
+            "schema_type": "SELLER_PROFILE",
+            "profile_keywords": ["ai art", "handmade frames", "sustainability", "gallery", "portland"],
+            "inferred_major": "Digital Arts",
+            "inferred_location_keywords": ["Portland"],
+            "sales_history_summary": [
+                {
+                    "category": "Art & Decor",
+                    "item_examples": [
+                        "eco print 'Neural Garden' with soy ink",
+                        "recycled-wood frame set with cedar inlay",
+                        "AI abstract 'Post-Human Bloom' on bamboo paper"
+                    ],
+                    "total_items_sold": 58,
+                    "avg_price_per_item": 51.7,
+                    "dominant_transaction_type_in_category": "sell"
+                }
+            ],
+            "overall_dominant_transaction_type": "sell",
+            "related_categories_of_interest": ["Gallery Exhibits", "Sustainable Materials"]
+        }
+    },
+    {
+        "name": "Marcus Rodriguez",
+        "email": "marcus.tech@university.edu",
+        "location": "Austin, TX",
+        "bio": "Computer Science student specializing in vintage electronics restoration. I buy, repair, and resell retro computers, gaming consoles, and audio equipment. Always looking for broken electronics to fix!",
+        "password": "password123",
+        "sellerProfile": {
+            "schema_type": "SELLER_PROFILE",
+            "profile_keywords": ["electronics", "vintage", "restoration", "gaming", "audio"],
+            "inferred_major": "Computer Science",
+            "inferred_location_keywords": ["Austin"],
+            "sales_history_summary": [
+                {
+                    "category": "Electronics",
+                    "item_examples": [
+                        "Restored 1984 Macintosh 128K",
+                        "Fixed Nintendo GameBoy Color with new screen",
+                        "Vintage Technics turntable with new belt"
+                    ],
+                    "total_items_sold": 34,
+                    "avg_price_per_item": 127.5,
+                    "dominant_transaction_type_in_category": "sell"
+                },
+                {
+                    "category": "Gaming",
+                    "item_examples": [
+                        "Retro game cartridge collection",
+                        "Custom modded Game Boy",
+                        "Restored arcade cabinet controls"
+                    ],
+                    "total_items_sold": 22,
+                    "avg_price_per_item": 89.2,
+                    "dominant_transaction_type_in_category": "sell"
+                }
+            ],
+            "overall_dominant_transaction_type": "sell",
+            "related_categories_of_interest": ["Retro Gaming", "Electronics Repair"]
+        }
+    },
+    {
+        "name": "Sofia Kim",
+        "email": "sofia.books@university.edu",
+        "location": "Boston, MA",
+        "bio": "Literature major and bookstore owner's daughter. I specialize in rare textbooks, first editions, and academic materials. Also trade vintage novels and poetry collections.",
+        "password": "password123",
+        "sellerProfile": {
+            "schema_type": "SELLER_PROFILE",
+            "profile_keywords": ["books", "textbooks", "literature", "rare editions", "academic"],
+            "inferred_major": "Literature",
+            "inferred_location_keywords": ["Boston"],
+            "sales_history_summary": [
+                {
+                    "category": "Textbooks",
+                    "item_examples": [
+                        "Advanced Calculus 8th Edition (like new)",
+                        "Organic Chemistry Study Guide Set",
+                        "Psychology: Mind & Behavior textbook bundle"
+                    ],
+                    "total_items_sold": 67,
+                    "avg_price_per_item": 45.8,
+                    "dominant_transaction_type_in_category": "sell"
+                },
+                {
+                    "category": "Books & Literature",
+                    "item_examples": [
+                        "First edition Virginia Woolf collection",
+                        "Signed copy of contemporary poetry anthology",
+                        "Vintage philosophy reader with notes"
+                    ],
+                    "total_items_sold": 29,
+                    "avg_price_per_item": 78.3,
+                    "dominant_transaction_type_in_category": "sell"
+                }
+            ],
+            "overall_dominant_transaction_type": "sell",
+            "related_categories_of_interest": ["Academic Resources", "Literary Collections"]
+        }
+    },
+]
+
+
+@app.post("/api/users/seed-defaults")
+async def seed_default_profiles() -> Dict[str, Any]:
+    """Create default user profiles with seller data and upload to MongoDB."""
+    db = get_db()
+    created_count = 0
+    skipped_count = 0
+    
+    for profile_data in DEFAULT_PROFILES:
+        # Check if user already exists
+        existing_user = await db.users.find_one({"email": profile_data["email"]})
+        if existing_user:
+            skipped_count += 1
+            continue
+        
+        # Hash password
+        hashed_password = hash_password(profile_data["password"])
+        
+        # Create user document
+        user_doc = {
+            "name": profile_data["name"],
+            "email": profile_data["email"],
+            "password": hashed_password,
+            "location": profile_data["location"],
+            "bio": profile_data["bio"],
+            "verified": True,
+            "trust_score": 85,
+            "rating": 4.5,
+            "past_trades": sum(
+                cat.get("total_items_sold", 0)
+                for cat in profile_data["sellerProfile"]["sales_history_summary"]
+            ),
+            "badges": ["Verified Student", "Top Seller"],
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        
+        # Insert user
+        result = await db.users.insert_one(user_doc)
+        user_id = str(result.inserted_id)
+        
+        # Create seller profile
+        seller_profile = profile_data["sellerProfile"]
+        seller_profile_doc = {
+            "schema_type": seller_profile["schema_type"],
+            "user_id": user_id,
+            "context": {"original_text": profile_data["bio"]},
+            "profile_keywords": seller_profile["profile_keywords"],
+            "inferred_major": seller_profile["inferred_major"],
+            "inferred_location_keywords": seller_profile["inferred_location_keywords"],
+            "sales_history_summary": seller_profile["sales_history_summary"],
+            "overall_dominant_transaction_type": seller_profile["overall_dominant_transaction_type"],
+            "related_categories_of_interest": seller_profile["related_categories_of_interest"],
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        
+        # Insert seller profile
+        profile_result = await db.seller_profiles.insert_one(seller_profile_doc)
+        profile_id = profile_result.inserted_id
+        
+        # Update user with seller profile reference
+        await db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"seller_profile_id": profile_id, "updated_at": datetime.utcnow()}}
+        )
+        
+        created_count += 1
+    
+    return {
+        "success": True,
+        "created": created_count,
+        "skipped": skipped_count,
+        "total": len(DEFAULT_PROFILES)
     }
 
