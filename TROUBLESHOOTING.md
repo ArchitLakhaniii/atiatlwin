@@ -19,6 +19,29 @@ Service shows "Deploy failed" or keeps restarting in Render dashboard.
   - Wrong Python/Node version
   - Build command typos
 
+#### 1a. ModuleNotFoundError: No module named 'sklearn'
+**This is a common issue with the backend!**
+
+**Error:**
+```
+ModuleNotFoundError: No module named 'sklearn'
+```
+
+**Cause:** The ML model requires scikit-learn, which must be in requirements.txt.
+
+**Solution:**
+Make sure `backend-service/requirements.txt` includes:
+```
+scikit-learn>=1.3.0
+```
+
+This should already be fixed in the latest version. If you see this error:
+1. Check your requirements.txt has scikit-learn
+2. Push changes to GitHub
+3. Render will auto-redeploy
+
+See `FIX_SKLEARN_ISSUE.md` for details.
+
 #### 2. Verify Build Commands
 
 **Gemini Service:**
